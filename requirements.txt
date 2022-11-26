@@ -1,0 +1,5 @@
+tqdm
+elasticsearch[async]
+python-dotenv
+python-magic
+python-magic-bin ; sys_platform == 'win32'
