@@ -1,3 +1,6 @@
 data/
 .env
 schemas/
+**pycache**
+**.pytest_cache**
+**PYTEST_TMPDIR**
