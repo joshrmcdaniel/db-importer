@@ -5,6 +5,7 @@ import os
 from argparse import ArgumentParser
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import freeze_support
+from platform import system
 from rarfile import RarFile
 from tqdm.contrib.concurrent import process_map
 from tarfile import TarFile
@@ -34,7 +35,8 @@ SCHEMA_LINES = None
 
 def dump_schemas(data_path: str, schema_path: str, proc_count: int, tp_count: int, lines: int) -> None:
     set_globes(data_path, schema_path, proc_count, tp_count, lines)
-    freeze_support()
+    if system() == 'Windows':
+        freeze_support()
     if not os.path.exists(SCHEMA_PATH):
         os.mkdir(SCHEMA_PATH)
     data_files = os.listdir(DATA_PATH)
