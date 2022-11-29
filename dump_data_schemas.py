@@ -94,7 +94,7 @@ def get_schema_from_file(file_name: str, fp: Union[Compressed, None]=None) -> No
             print('IOError')
         print(f'Exception info: {fe}')
     else:
-        with open(f'{SCHEMA_PATH}{file_name}.schema', 'wb') as wf:
+        with open(f'{SCHEMA_PATH}{file_name.replace("/", "-sep-")}.schema', 'wb') as wf:
             wf.write(lines)
     finally:
         handle.close()
