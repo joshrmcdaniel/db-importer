@@ -1,4 +1,3 @@
-import magic
 import os
 
 
@@ -6,11 +5,19 @@ from argparse import ArgumentParser
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import freeze_support
 from platform import system
+from tarfile import TarFile, TarInfo
+from typing import Dict, List, Optional, TypeVar
+from zipfile import ZipFile
+
+
 from rarfile import RarFile
 from tqdm.contrib.concurrent import process_map
-from tarfile import TarFile
-from typing import Dict, List, TypeVar, Union
-from zipfile import ZipFile
+
+
+import magic
+
+
+from .exceptions import FileTypeException
 
 
 Compressed = TypeVar('Compressed', RarFile, ZipFile, TarFile)
@@ -34,6 +41,9 @@ SCHEMA_LINES = None
 
 
 def dump_schemas(data_path: str, schema_path: str, proc_count: int, tp_count: int, lines: int) -> None:
+    """
+    Dump schemas from each compressed file
+    """
     set_globes(data_path, schema_path, proc_count, tp_count, lines)
     if system() == 'Windows':
         freeze_support()
@@ -57,21 +67,27 @@ def get_schemas(file: str) -> None:
     if file_obj:
         if isinstance(file_obj, str):
             #  Assumes tar file based on mapping
-            if ext == 'tar':
+            if file_obj == 'tar':
                 ext = ''
+            else:
+                ext = file_obj
             file_obj = lambda x, m: TarFile(x, f'{m}:{ext}')
+
         with file_obj(DATA_PATH+file, 'r') as f:
-            with ThreadPoolExecutor(max_workers=THREAD_POOL_COUNT) as proc_pool:
-                f_names = get_filenames(f)
+            f_names = get_filenames(f)
+            thread_count = min(len(f_names), THREAD_POOL_COUNT)
+
+            with ThreadPoolExecutor(max_workers=thread_count) as proc_pool:
                 for f_name in f_names:
                     proc_pool.submit(get_schema_from_file, f_name, f)
+
     elif mime == 'text/plain':
         get_schema_from_file(file)
     else:
         raise NotImplementedError(f'no support for {mime}')
 
 
-def get_schema_from_file(file_name: str, fp: Union[Compressed, None]=None) -> None:
+def get_schema_from_file(file_name: str, fp: Optional[Compressed]=None) -> None:
     """
     Get lines of file content in a ZIP file
     """
@@ -79,32 +95,88 @@ def get_schema_from_file(file_name: str, fp: Union[Compressed, None]=None) -> No
         if fp:
             if isinstance(fp, TarFile):
                 handle = fp.extractfile(file_name)
+                if handle is None:
+                    print(f'Handle for {file_name} is None, skipping')
+                    return
             else:
                 handle = fp.open(file_name, 'r')
+            if is_directory(fp):
+                f_names = get_filenames(fp)
+                thread_count = min(len(f_names), THREAD_POOL_COUNT)
+                with ThreadPoolExecutor(max_workers=thread_count) as inner_proc_pool:
+                    for f_name in f_names:
+                        inner_proc_pool.submit(get_schema_from_file, f_name, fp)
         else:
             handle = open(file_name, 'rb')
-        handle.seek(-1,2)
-        eof = handle.tell()
-        handle.seek(0,0)
+        eof = get_eof(handle)
         lines = b''.join(handle.readline() for _ in range(SCHEMA_LINES) if handle.tell() != eof)
-    except (FileNotFoundError, IOError) as fe:
-        if isinstance(fe, FileNotFoundError):
+    except (FileNotFoundError, IOError) as file_error:
+        if isinstance(file_error, FileNotFoundError):
             print(f'{file_name} does not exist in {fp.filename}')
         else:
             print('IOError')
-        print(f'Exception info: {fe}')
+        print(f'Exception info: {file_error}')
     else:
-        with open(f'{SCHEMA_PATH}{file_name.replace("/", "-sep-")}.schema', 'wb') as wf:
-            wf.write(lines)
+        write_schema(file_name, lines)
     finally:
         handle.close()
 
 
-def get_filenames(f: Union[RarFile, TarFile, ZipFile]) -> List[str]:
+def write_schema(file_path: str, data: bytes):
+    """
+    Write schema to file
+    """
+    file_dest = f'{SCHEMA_PATH}{file_path.replace("/", "-sep-")}.schema'
+    try:
+        with open(file_dest, 'wb') as out_file:
+            out_file.write(data)
+    except IOError as io_e:
+        print(f'IOError occured when writing {file_dest}: {io_e}')
+        print('Not writing file')
+
+
+def get_filenames(f: Compressed) -> List[str]:
+    """
+    Get files within an archive
+    """
     if isinstance(f, (RarFile, ZipFile)):
         return f.namelist()
-    elif isinstance(f, TarFile):
+
+    if isinstance(f, TarFile):
         return f.getnames()
+
+    raise FileTypeException(f'Unknown filetype: {type(f).__name__}')
+
+
+def is_directory(file_handle: Compressed) -> bool:
+    """
+    See if the file is a directory
+    """
+    if isinstance(file_handle, TarFile):
+        info = TarInfo.fromtarfile(file_handle)
+        return info.isdir()
+    if isinstance(file_handle, ZipFile):
+        info = file_handle.getinfo()
+        info_bits = info.external_attr >> 16
+
+        #  Check the bits for directory attributes
+        return (info_bits & 0x4000) > 0
+    if isinstance(file_handle, RarFile):
+        info = file_handle.getinfo()
+        return info.is_dir()
+
+    raise FileTypeException(f'Unknown filetype: {type(file_handle).__name__}')
+
+
+def get_eof(fp: Compressed) -> int:
+    """
+    Get end of file
+    """
+    fp.seek(-1,2)
+    eof = fp.tell()
+    fp.seek(0,0)
+
+    return eof
 
 
 def set_globes(data_path: str, schema_path: str, proc_count: int, tp_count: int, lines: int):
@@ -123,6 +195,13 @@ if __name__ == '__main__':
     parser.add_argument('-p', '--process-count', help='Concurrent processes to run', type=int, default=10, dest='proc_count')
     parser.add_argument('-t', '--thread-pool-count', help='Threads to use for zip file reading', type=int, default=5, dest='thread_count')
     parser.add_argument('-l', '--lines', help='Lines to read from each file', type=int, default=2, dest='lines')
-
     args = parser.parse_args()
+
+    DATA_PATH = args.dp
+    SCHEMA_PATH = args.sp
+    PROC_COUNT = args.proc_count
+    THREAD_POOL_COUNT = args.thread_count
+    SCHEMA_LINES = args.lines
+
     dump_schemas(args.dp, args.sp, args.proc_count, args.thread_count, args.lines)
+    
