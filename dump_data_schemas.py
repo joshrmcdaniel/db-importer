@@ -1,3 +1,7 @@
+"""
+Script for concurrent zip extraction of a few lines/file to ensure schema consistency
+"""
+
 import os
 
 
@@ -8,6 +12,7 @@ from io import BufferedReader, StringIO
 from multiprocessing import freeze_support
 from platform import system
 from tarfile import TarFile, TarInfo
+from traceback import format_exc
 from typing import Any, Callable, Dict, List, Optional, TypeVar, Union
 from zipfile import ZipFile
 
@@ -23,7 +28,7 @@ from .exceptions import FileTypeException
 
 
 Compressed = TypeVar('Compressed', RarFile, ZipFile, TarFile)
-
+ExtractedFile = TypeVar('ExtractedFile', RarFile, StringIO, TarFile, ZipFile)
 
 ON_ERROR = Enum('ON_ERROR', ['SKIP', 'WARN', 'RAISE'])
 
@@ -73,15 +78,11 @@ def get_schemas(file: str) -> None:
     (Assumes file content is consistent on each line)
     """
     file_path = os.path.join(DATA_PATH, file)
-    with open_file_path(file_path) as f:
-        run_thread_pool(get_schema_from_file, )
-        f_names = get_filenames(f)
-        thread_count = min(len(f_names), THREAD_POOL_COUNT)
-
-        with ThreadPoolExecutor(max_workers=thread_count) as proc_pool:
-            for f_name in f_names:
-                proc_pool.submit(get_schema_from_file, f_name, f)
-
+    try:
+        with open_file_path(file_path) as f:
+            run_thread_pool(get_schema_from_file, get_filenames(f), f)
+    except FileTypeException as fte:
+        handle_error(fte)
 
 #  TODO: write func (if even needed)
 def process_nested_io_dirs(file_io: Union[Compressed, BufferedReader]):
@@ -100,21 +101,14 @@ def get_schema_from_file(file_name: str, fp: Optional[Compressed]=None) -> None:
     """
     try:
         handle = extract_file(file_name, fp)
-        if handle is None:
-            if isinstance(fp, TarFile):
-                handle = fp.getmember(file_name)
-            else:
-                msg = 'I have no clue how this returned none'
-                handle_error(FileNotFoundError, msg)
-                return
-
-        if handle is None and isinstance(fp, TarFile):
-            handle = fp.getmember(file_name)
 
         if is_directory(handle) or is_compressed(handle):
             process_nested_io_dirs(handle)
             handle.close()
             return
+        if isinstance(handle, TarInfo):
+            msg = f'{file_name} returned None on extraction and is not a dir or compressed file'
+            handle_error(FileTypeException, msg)
 
         eof = get_eof(handle)
         lines = b''.join(handle.readline() for _ in range(SCHEMA_LINES) if handle.tell() != eof)
@@ -180,8 +174,7 @@ def is_directory(file_handle: Union[Compressed, TarInfo]) -> bool:
     if isinstance(file_handle, StringIO):
         return False
 
-    msg = f'Unknown filetype: {type(file_handle).__name__}'
-    handle_error(FileTypeException, msg)
+    raise FileTypeException(f'Unknown filetype: {type(file_handle).__name__}')
 
 
 def is_compressed(file_handle: Union[Compressed, StringIO]) -> bool:
@@ -206,7 +199,7 @@ def get_eof(fp: Compressed) -> int:
     return eof
 
 
-def open_file_path(file_path: str) -> Optional[Union[Compressed, StringIO]]:
+def open_file_path(file_path: str) -> ExtractedFile:
     """
     Handler for opening supported filetype paths
     """
@@ -215,9 +208,7 @@ def open_file_path(file_path: str) -> Optional[Union[Compressed, StringIO]]:
     file_type = MIME_MAP.get(mime, None)
 
     if file_type is None:
-        msg = f'Unsupported file type: {mime}'
-        handle_error(FileTypeException, msg)
-        return
+        raise FileTypeException(f'Unsupported file type: {mime}')
 
     if isinstance(file_type, str):
         return TarFile(file_path, f'r:{file_type}')
@@ -235,20 +226,21 @@ def open_file_path(file_path: str) -> Optional[Union[Compressed, StringIO]]:
 def open_file_handle(file_path: Union[bytes, str], handle: Compressed):
     pass
 
-def extract_file(file_name: str, fp: Optional[Compressed]=None):
+def extract_file(file_name: str, fp: Optional[Compressed]=None) -> Union[ExtractedFile, TarInfo]:
     """
     Handle extraction of multiple file types
     """
     if fp is not None:
         if isinstance(fp, TarFile):
-            return fp.extractfile(file_name, 'r')
+            extracted = fp.extractfile(file_name)
+            if extracted is None:
+                extracted = fp.getmember(file_name)
+            return extracted
 
         if isinstance(fp, (RarFile, ZipFile)):
             return fp.open(file_name, 'r')
 
-        msg = f'Unknown filetype for {file_name} (in handler {type(fp).__name__})'
-        handle_error(FileTypeException, msg)
-        return
+        raise FileTypeException(f'Unknown filetype for {file_name} (in handler {type(fp).__name__})')
 
     return open(file_name, 'r', encoding='utf-8')
 
@@ -263,7 +255,7 @@ def run_thread_pool(func: Callable[[List[str], Compressed], None], *args: List[U
             proc_pool.submit(func, filename, args[1])
 
 
-def handle_error(exc: Exception, msg: str) -> None:
+def handle_error(exc: Exception) -> None:
     """
     Error handling to reduce code bloat
     TODO: find a better way
@@ -271,9 +263,10 @@ def handle_error(exc: Exception, msg: str) -> None:
     if ERROR_BEHAVIOR is ON_ERROR.SKIP:
         return
     if ERROR_BEHAVIOR is ON_ERROR.WARN:
-        print(msg)
+        print(str(exc))
     if ERROR_BEHAVIOR is ON_ERROR.RAISE:
-        raise exc(msg)
+        print(format_exc(exc))
+        raise exc
 
 
 def set_globes(data_path: str, schema_path: str, proc_count: int, tp_count: int, lines: int):
