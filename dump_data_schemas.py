@@ -8,7 +8,7 @@ from io import BufferedReader, StringIO
 from multiprocessing import freeze_support
 from platform import system
 from tarfile import TarFile, TarInfo
-from typing import Dict, List, Optional, TypeVar, Union
+from typing import Any, Callable, Dict, List, Optional, TypeVar, Union
 from zipfile import ZipFile
 
 
@@ -25,7 +25,7 @@ from .exceptions import FileTypeException
 Compressed = TypeVar('Compressed', RarFile, ZipFile, TarFile)
 
 
-ON_ERROR = Enum('OnError', ['SKIP', 'WARN', 'ERROR'])
+ON_ERROR = Enum('ON_ERROR', ['SKIP', 'WARN', 'RAISE'])
 
 
 MIME_MAP: Dict[str, Compressed] = {
@@ -73,7 +73,8 @@ def get_schemas(file: str) -> None:
     (Assumes file content is consistent on each line)
     """
     file_path = os.path.join(DATA_PATH, file)
-    with open_file(file_path) as f:
+    with open_file_path(file_path) as f:
+        run_thread_pool(get_schema_from_file, )
         f_names = get_filenames(f)
         thread_count = min(len(f_names), THREAD_POOL_COUNT)
 
@@ -82,6 +83,7 @@ def get_schemas(file: str) -> None:
                 proc_pool.submit(get_schema_from_file, f_name, f)
 
 
+#  TODO: write func (if even needed)
 def process_nested_io_dirs(file_io: Union[Compressed, BufferedReader]):
     """
     Process pool for io dir schema dumping
@@ -89,6 +91,7 @@ def process_nested_io_dirs(file_io: Union[Compressed, BufferedReader]):
     if not isinstance(file_io, (RarFile, TarFile, ZipFile)):
         raise NotImplementedError(f'{type(file_io).__name__} not currently supported')
 
+    run_thread_pool(get_schema_from_file, get_filenames(file_io), file_io)
 
 
 def get_schema_from_file(file_name: str, fp: Optional[Compressed]=None) -> None:
@@ -99,29 +102,28 @@ def get_schema_from_file(file_name: str, fp: Optional[Compressed]=None) -> None:
         handle = extract_file(file_name, fp)
         if handle is None:
             if isinstance(fp, TarFile):
-                handle_info = fp.getmember(file_name)
-                if handle_info.isdir():
-                    process_nested_io_dirs(fp)
+                handle = fp.getmember(file_name)
             else:
-        if is_directory(handle):
+                msg = 'I have no clue how this returned none'
+                handle_error(FileNotFoundError, msg)
+                return
+
+        if handle is None and isinstance(fp, TarFile):
+            handle = fp.getmember(file_name)
+
+        if is_directory(handle) or is_compressed(handle):
             process_nested_io_dirs(handle)
             handle.close()
             return
-        if isinstance(handle, (RarFile, TarFile, ZipFile))
-            f_names = get_filenames(fp)
-            thread_count = min(len(f_names), THREAD_POOL_COUNT)
-            with ThreadPoolExecutor(max_workers=thread_count) as inner_proc_pool:
-                for f_name in f_names:
-                    inner_proc_pool.submit(get_schema_from_file, f_name, fp)
-            return
+
         eof = get_eof(handle)
         lines = b''.join(handle.readline() for _ in range(SCHEMA_LINES) if handle.tell() != eof)
     except (FileNotFoundError, IOError) as file_error:
         if isinstance(file_error, FileNotFoundError):
-            print(f'{file_name} does not exist in {fp.filename}')
+            msg = f'{file_name} does not exist in {fp.filename}'
+            handle_error(file_error, msg)
         else:
-            print('IOError')
-        print(f'Exception info: {file_error}')
+            handle_error('Unknown IO Error', file_error)
     else:
         write_schema(file_name, lines)
     finally:
@@ -154,13 +156,16 @@ def get_filenames(f: Compressed) -> List[str]:
     raise FileTypeException(f'Unknown filetype: {type(f).__name__}')
 
 
-def is_directory(file_handle: Compressed) -> bool:
+def is_directory(file_handle: Union[Compressed, TarInfo]) -> bool:
     """
     See if the file is a directory
     """
     if isinstance(file_handle, TarFile):
         info = TarInfo.fromtarfile(file_handle)
         return info.isdir()
+
+    if isinstance(file_handle, TarInfo):
+        return file_handle.isdir()
 
     if isinstance(file_handle, ZipFile):
         info = file_handle.getinfo()
@@ -175,12 +180,19 @@ def is_directory(file_handle: Compressed) -> bool:
     if isinstance(file_handle, StringIO):
         return False
 
-    raise FileTypeException(f'Unknown filetype: {type(file_handle).__name__}')
+    msg = f'Unknown filetype: {type(file_handle).__name__}'
+    handle_error(FileTypeException, msg)
 
 
 def is_compressed(file_handle: Union[Compressed, StringIO]) -> bool:
-    file_handle.read()
-    return magic.from_file()
+    """
+    Check if file in handler is compressed
+    """
+    header = file_handle.read(512)
+    file_handle.seek(0, 0)
+    mime = magic.from_file(header, mime=True)
+    res = MIME_MAP.get(mime, None)
+    return res is not None and not isinstance(res, StringIO)
 
 
 def get_eof(fp: Compressed) -> int:
@@ -194,27 +206,34 @@ def get_eof(fp: Compressed) -> int:
     return eof
 
 
-def open_file_path(file_path: Union[bytes, str], handle: Optional[Union[Compressed, StringIO]]=None) -> Optional[Union[Compressed, StringIO]]:
+def open_file_path(file_path: str) -> Optional[Union[Compressed, StringIO]]:
     """
-    Handler for opening supported filetypes
+    Handler for opening supported filetype paths
     """
-    if handle:
+
     mime = magic.from_file(file_path, mime=True)
     file_type = MIME_MAP.get(mime, None)
+
     if file_type is None:
-        print(f'Unsupported file type: {mime}, skipping')
+        msg = f'Unsupported file type: {mime}'
+        handle_error(FileTypeException, msg)
         return
+
     if isinstance(file_type, str):
-        file_obj = TarFile(file_path, f'r:{file_type}')
-    elif isinstance(file_type, RarFile):
-        file_obj = RarFile(file_path, 'r')
-    elif isinstance(file_type, ZipFile):
-        file_obj = ZipFile(file_path, 'r')
-    elif file_type == StringIO:
-        file_obj = open(file_path, 'r', encoding='utf-8')
+        return TarFile(file_path, f'r:{file_type}')
 
-    return file_obj
+    if isinstance(file_type, RarFile):
+        return RarFile(file_path, 'r')
 
+    if isinstance(file_type, ZipFile):
+        return ZipFile(file_path, 'r')
+
+    if file_type == StringIO:
+        return open(file_path, 'r', encoding='utf-8')
+
+
+def open_file_handle(file_path: Union[bytes, str], handle: Compressed):
+    pass
 
 def extract_file(file_name: str, fp: Optional[Compressed]=None):
     """
@@ -227,9 +246,34 @@ def extract_file(file_name: str, fp: Optional[Compressed]=None):
         if isinstance(fp, (RarFile, ZipFile)):
             return fp.open(file_name, 'r')
 
-        raise FileTypeException('Unknown filetype')
+        msg = f'Unknown filetype for {file_name} (in handler {type(fp).__name__})'
+        handle_error(FileTypeException, msg)
+        return
 
     return open(file_name, 'r', encoding='utf-8')
+
+
+def run_thread_pool(func: Callable[[List[str], Compressed], None], *args: List[Union[List[str], Compressed]]):
+    """
+    Run extraction method
+    """
+    thread_count = min(len(args), THREAD_POOL_COUNT)
+    with ThreadPoolExecutor(max_workers=thread_count) as proc_pool:
+        for filename in args[0]:
+            proc_pool.submit(func, filename, args[1])
+
+
+def handle_error(exc: Exception, msg: str) -> None:
+    """
+    Error handling to reduce code bloat
+    TODO: find a better way
+    """
+    if ERROR_BEHAVIOR is ON_ERROR.SKIP:
+        return
+    if ERROR_BEHAVIOR is ON_ERROR.WARN:
+        print(msg)
+    if ERROR_BEHAVIOR is ON_ERROR.RAISE:
+        raise exc(msg)
 
 
 def set_globes(data_path: str, schema_path: str, proc_count: int, tp_count: int, lines: int):
@@ -248,7 +292,7 @@ if __name__ == '__main__':
     parser.add_argument('-p', '--process-count', help='Concurrent processes to run', type=int, default=10, dest='proc_count')
     parser.add_argument('-t', '--thread-pool-count', help='Threads to use for zip file reading', type=int, default=5, dest='thread_count')
     parser.add_argument('-l', '--lines', help='Lines to read from each file', type=int, default=2, dest='lines')
-    parser.add_argument('-e', '--on-error', help='Behavior when an error occures', type=str, default='skip', choices=['skip', 'warn', 'error'],dest='on_error')
+    parser.add_argument('-e', '--on-error', help='Behavior when an error occures', type=str, default='warn', choices=['skip', 'warn', 'raise'],dest='on_error')
     args = parser.parse_args()
 
     DATA_PATH = args.dp
@@ -260,8 +304,7 @@ if __name__ == '__main__':
         ERROR_BEHAVIOR = ON_ERROR.SKIP
     elif args.on_error == 'warn':
         ERROR_BEHAVIOR = ON_ERROR.WARN
-    elif args.on_error == 'error':
-        ERROR_BEHAVIOR = ON_ERROR.ERROR
+    elif args.on_error == 'raise':
+        ERROR_BEHAVIOR = ON_ERROR.RAISE
 
     dump_schemas(args.dp, args.sp, args.proc_count, args.thread_count, args.lines)
-    
