@@ -13,7 +13,7 @@ from multiprocessing import freeze_support
 from platform import system
 from tarfile import TarFile, TarInfo
 from traceback import format_exc
-from typing import Any, Callable, Dict, List, Optional, TypeVar, Union
+from typing import Callable, Dict, List, Optional, TypeVar, Union
 from zipfile import ZipFile
 
 
@@ -79,10 +79,12 @@ def get_schemas(file: str) -> None:
     """
     file_path = os.path.join(DATA_PATH, file)
     try:
-        with open_file_path(file_path) as f:
-            run_thread_pool(get_schema_from_file, get_filenames(f), f)
+        file_handler = open_file_path(file_path)
     except FileTypeException as fte:
         handle_error(fte)
+    else:
+        run_thread_pool(get_schema_from_file, get_filenames(file_handler), file_handler)
+        file_handler.close()
 
 #  TODO: write func (if even needed)
 def process_nested_io_dirs(file_io: Union[Compressed, BufferedReader]):
@@ -90,7 +92,7 @@ def process_nested_io_dirs(file_io: Union[Compressed, BufferedReader]):
     Process pool for io dir schema dumping
     """
     if not isinstance(file_io, (RarFile, TarFile, ZipFile)):
-        raise NotImplementedError(f'{type(file_io).__name__} not currently supported')
+        handle_error(NotImplementedError(f'{type(file_io).__name__} not currently supported'))
 
     run_thread_pool(get_schema_from_file, get_filenames(file_io), file_io)
 
@@ -107,19 +109,19 @@ def get_schema_from_file(file_name: str, fp: Optional[Compressed]=None) -> None:
             handle.close()
             return
         if isinstance(handle, TarInfo):
-            msg = f'{file_name} returned None on extraction and is not a dir or compressed file'
-            handle_error(FileTypeException, msg)
+            handle_error(FileTypeException(f'{file_name} returned None on extraction and is not a dir or compressed file'))
 
         eof = get_eof(handle)
         lines = b''.join(handle.readline() for _ in range(SCHEMA_LINES) if handle.tell() != eof)
-    except (FileNotFoundError, IOError) as file_error:
-        if isinstance(file_error, FileNotFoundError):
-            msg = f'{file_name} does not exist in {fp.filename}'
-            handle_error(file_error, msg)
-        else:
-            handle_error('Unknown IO Error', file_error)
+    except (FileNotFoundError, IOError, FileTypeException) as file_error:
+        handle_error(file_error)
+
     else:
-        write_schema(file_name, lines)
+        try:
+            write_schema(file_name, lines)
+        except IOError as io_e:
+            handle.close()
+            handle_error(io_e)
     finally:
         handle.close()
 
@@ -133,8 +135,7 @@ def write_schema(file_path: str, data: bytes):
         with open(file_dest, 'wb') as out_file:
             out_file.write(data)
     except IOError as io_e:
-        print(f'IOError occured when writing {file_dest}: {io_e}')
-        print('Not writing file')
+        handle_error(io_e)
 
 
 def get_filenames(f: Compressed) -> List[str]:
@@ -223,9 +224,6 @@ def open_file_path(file_path: str) -> ExtractedFile:
         return open(file_path, 'r', encoding='utf-8')
 
 
-def open_file_handle(file_path: Union[bytes, str], handle: Compressed):
-    pass
-
 def extract_file(file_name: str, fp: Optional[Compressed]=None) -> Union[ExtractedFile, TarInfo]:
     """
     Handle extraction of multiple file types
@@ -286,18 +284,18 @@ if __name__ == '__main__':
     parser.add_argument('-t', '--thread-pool-count', help='Threads to use for zip file reading', type=int, default=5, dest='thread_count')
     parser.add_argument('-l', '--lines', help='Lines to read from each file', type=int, default=2, dest='lines')
     parser.add_argument('-e', '--on-error', help='Behavior when an error occures', type=str, default='warn', choices=['skip', 'warn', 'raise'],dest='on_error')
-    args = parser.parse_args()
+    runtime_args = parser.parse_args()
 
-    DATA_PATH = args.dp
-    SCHEMA_PATH = args.sp
-    PROC_COUNT = args.proc_count
-    THREAD_POOL_COUNT = args.thread_count
-    SCHEMA_LINES = args.lines
-    if args.on_error == 'skip':
+    DATA_PATH = runtime_args.dp
+    SCHEMA_PATH = runtime_args.sp
+    PROC_COUNT = runtime_args.proc_count
+    THREAD_POOL_COUNT = runtime_args.thread_count
+    SCHEMA_LINES = runtime_args.lines
+    if runtime_args.on_error == 'skip':
         ERROR_BEHAVIOR = ON_ERROR.SKIP
-    elif args.on_error == 'warn':
+    elif runtime_args.on_error == 'warn':
         ERROR_BEHAVIOR = ON_ERROR.WARN
-    elif args.on_error == 'raise':
+    elif runtime_args.on_error == 'raise':
         ERROR_BEHAVIOR = ON_ERROR.RAISE
 
-    dump_schemas(args.dp, args.sp, args.proc_count, args.thread_count, args.lines)
+    dump_schemas(runtime_args.dp, runtime_args.sp, runtime_args.proc_count, runtime_args.thread_count, runtime_args.lines)
